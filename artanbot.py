@@ -9,8 +9,8 @@ import asyncio
 import time
 import html
 from html.parser import HTMLParser
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
@@ -169,7 +169,7 @@ def fetch_and_process_inbox(since_date=None):
         return [], []
 
 async def call_gemini_with_retry(prompt, max_retries=3):
-    """Wrapper with exponential backoff to automatically handle 429 rate limit spikes."""
+    """Wrapper with exponential backoff to automatically handle rate limit spikes."""
     delay = 10
     for attempt in range(max_retries):
         try:
@@ -179,15 +179,15 @@ async def call_gemini_with_retry(prompt, max_retries=3):
             )
             return response.text
         except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
                 if attempt < max_retries - 1:
-                    print(f"Rate limited (429). Retrying in {delay} seconds... (Attempt {attempt+1}/{max_retries})")
+                    print(f"API traffic spike / limit hit. Retrying in {delay} seconds... (Attempt {attempt+1}/{max_retries})")
                     await asyncio.sleep(delay)
                     delay *= 2 
                     continue
             print(f"Gemini API Error: {e}")
             return None
-    return None
     
 async def ai_summarize_whitelist_matches(instant_alerts):
     """Asks Gemini 3.5 Flash to organize and summarize whitelist hits with built-in retry."""
@@ -255,9 +255,91 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Invalid type. Use 'sender', 'domain', or 'keyword'.")
         return
-        
+
     save_whitelist(whitelist)
     await update.message.reply_text(f"✅ Successfully added `{value}` as a new whitelist {rule_type}!", parse_mode="Markdown")
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all active whitelist rules from local storage."""
+    whitelist = load_whitelist()
+    
+    senders = "\n".join([f"• `{s}`" for s in whitelist.get("senders", [])]) or "None"
+    domains = "\n".join([f"• `@{d}`" for d in whitelist.get("domains", [])]) or "None"
+    keywords = "\n".join([f"• `{kw}`" for kw in whitelist.get("keywords", [])]) or "None"
+    
+    text = (
+        "📋 *Active Local Whitelist Rules*\n\n"
+        f"*Senders:*\n{senders}\n\n"
+        f"*Domains:*\n{domains}\n\n"
+        f"*Keywords:*\n{keywords}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes a rule from local whitelist storage via Telegram."""
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage format: `/remove sender client@domain.com` or `/remove keyword \"update\"`", parse_mode="Markdown")
+        return
+        
+    rule_type = args[0].lower()
+    value = " ".join(args[1:]).strip('"')
+    whitelist = load_whitelist()
+    
+    removed = False
+    if rule_type == "sender" and value in whitelist.get("senders", []):
+        whitelist["senders"].remove(value)
+        removed = True
+    elif rule_type == "domain" and value in whitelist.get("domains", []):
+        whitelist["domains"].remove(value)
+        removed = True
+    elif rule_type == "keyword" and value.lower() in whitelist.get("keywords", []):
+        whitelist["keywords"].remove(value.lower())
+        removed = True
+        
+    if removed:
+        save_whitelist(whitelist)
+        await update.message.reply_text(f"🗑️ Successfully removed `{value}` from your whitelist {rule_type}s!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"⚠️ Could not find `{value}` under {rule_type}s in your whitelist.", parse_mode="Markdown")
+
+async def cmd_testbtn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a test message with inline buttons to verify UI functionality locally."""
+    keyboard = [
+        [InlineKeyboardButton("⚡ Whitelist Sender", callback_data="add_sender:test-client@domain.com")],
+        [InlineKeyboardButton("🗑️ Dismiss Alert", callback_data="dismiss_alert")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🧪 *Inline Button Test Panel*\nClick below to test local whitelisting and dismissal without calling the API:",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+        
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles interactive inline keyboard clicks locally to conserve token quotas."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data.startswith("add_sender:"):
+        sender_to_add = data.split(":", 1)[1]
+        whitelist = load_whitelist()
+        if sender_to_add not in whitelist["senders"]:
+            whitelist["senders"].append(sender_to_add)
+            save_whitelist(whitelist)
+            await query.edit_message_text(text=f"{query.message.text}\n\n✅ *Action Taken:* Added `{sender_to_add}` to whitelist!", parse_mode="Markdown")
+        else:
+            await query.answer("Sender is already whitelisted!", show_alert=True)
+            
+    elif data == "dismiss_alert":
+        await query.message.delete()
 
 async def run_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -285,16 +367,30 @@ async def run_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     wildcard_output = await ai_select_wildcards(unmatched[:3])
     
+    # Build standard interactive action keyboard for messages
+    keyboard = [
+        [
+            InlineKeyboardButton("🗑️ Dismiss Alert", callback_data="dismiss_alert")
+        ]
+    ]
+    
+    # If instant alerts were processed, allow quick-whitelisting the first detected sender if available
+    if instant_alerts and "sender" in instant_alerts[0]:
+        first_sender = instant_alerts[0]["sender"]
+        keyboard.insert(0, [InlineKeyboardButton("⚡ Whitelist Sender", callback_data=f"add_sender:{first_sender}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     if summary_output:
         if len(summary_output) > 4000:
             chunks = [summary_output[i:i+4000] for i in range(0, len(summary_output), 4000)]
             for chunk in chunks:
                 await context.bot.send_message(chat_id=CHAT_ID, text=chunk)
         else:
-            await context.bot.send_message(chat_id=CHAT_ID, text=summary_output)
+            await context.bot.send_message(chat_id=CHAT_ID, text=summary_output, reply_markup=reply_markup)
         
     if wildcard_output and "NONE" not in wildcard_output:
-        await context.bot.send_message(chat_id=CHAT_ID, text=wildcard_output)
+        await context.bot.send_message(chat_id=CHAT_ID, text=wildcard_output, reply_markup=reply_markup)
         
     if not instant_alerts and (not wildcard_output or "NONE" in wildcard_output):
         await context.bot.send_message(chat_id=CHAT_ID, text="Inbox checked. No critical hits or wildcards found.")
@@ -304,24 +400,21 @@ if __name__ == "__main__":
         print("Error: TELEGRAM_BOT_TOKEN is missing from your .env file!")
         exit(1)
 
-    print("🤖 Bot is starting up and connecting to Telegram...")
-    
     while True:
         try:
             application = ApplicationBuilder().token(BOT_TOKEN).build()
             
             application.add_handler(CommandHandler("add", cmd_add))
+            application.add_handler(CommandHandler("list", cmd_list))
+            application.add_handler(CommandHandler("remove", cmd_remove)) 
             application.add_handler(CommandHandler("scan", run_scan_command))
+            application.add_handler(CommandHandler("testbtn", cmd_testbtn))
+            application.add_handler(CallbackQueryHandler(button_handler))
             
             print("🤖 Bot is now live and listening for Telegram commands...")
             
-            # Polling configuration optimized with timeouts to handle network hiccups smoothly
             application.run_polling(
-                drop_pending_updates=True,
-                read_timeout=30,
-                write_timeout=30,
-                connect_timeout=30,
-                pool_timeout=30
+                drop_pending_updates=True
             )
             
         except Exception as e:
